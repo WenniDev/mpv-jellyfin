@@ -19,12 +19,23 @@ local options = {
     colour_default = "FFFFFF",
     colour_selected = "FF",
     colour_watched = "A0A0A0",
-    sort_mode = 0
+    sort_mode = 0,
+    connect_timeout = 5
 }
 opt.read_options(options, mp.get_script_name())
-if options.url:sub(-1) == "/" then
-    options.url = options.url:sub(1, -2)
+
+local function parse_server_urls(urls_option)
+    local server_urls = {}
+    for url in string.gmatch(urls_option, "[^%s,;]+") do
+        if url:sub(-1) == "/" then url = url:sub(1, -2) end
+        table.insert(server_urls, url)
+    end
+    return server_urls
 end
+
+local urls = parse_server_urls(options.url)
+local url_index = 1
+options.url = urls[1] or ""
 
 local overlay = mp.create_osd_overlay("ass-events")
 local meta_overlay = mp.create_osd_overlay("ass-events")
@@ -57,6 +68,7 @@ local move_up -- function
 local move_right -- function
 local move_down -- function
 local move_left -- function
+local connect_to_first_answering_server -- function
 
 local function mkdir(path)
     if is_windows then
@@ -66,7 +78,11 @@ local function mkdir(path)
     end
 end
 
-local function send_request(method, url)
+local function next_url_index()
+    return url_index % #urls + 1
+end
+
+local function send_request(method, url, is_retry)
     if #api_key > 0 then
         local start_time = mp.get_time()
         local request = mp.command_native({
@@ -74,9 +90,18 @@ local function send_request(method, url)
             capture_stdout = true,
             capture_stderr = true,
             playback_only = false,
-            args = {"curl", "-X", method, url, "-H", "Authorization: MediaBrowser Token=\""..api_key.."\""}
+            args = {"curl", "--connect-timeout", tostring(options.connect_timeout), "-X", method, url, "-H", "Authorization: MediaBrowser Token=\""..api_key.."\""}
         })
         msg.debug(string.format("Waited %.3f seconds for response from Jellyfin server", mp.get_time() - start_time))
+        local server_unreachable = request.status ~= 0
+        if server_unreachable and not is_retry and #urls > 1 then
+            local unreachable_url = options.url
+            msg.warn("Jellyfin server "..unreachable_url.." didn't answer, trying the next one")
+            if connect_to_first_answering_server(next_url_index()) and url:sub(1, #unreachable_url) == unreachable_url then
+                return send_request(method, options.url..url:sub(#unreachable_url + 1), true)
+            end
+            return nil
+        end
         return utils.parse_json(request.stdout)
     end
     return nil
@@ -362,7 +387,7 @@ local function key_left()
     end
 end
 
-local function connect()
+local function authenticate_on_server(url)
     local req = mp.command_native({
         name = "subprocess",
         capture_stdout = true,
@@ -371,8 +396,9 @@ local function connect()
         args = {
             "curl",
             "-sS",
+            "--connect-timeout", tostring(options.connect_timeout),
             "-X", "POST",
-            options.url .. "/Users/AuthenticateByName",
+            url .. "/Users/AuthenticateByName",
             "-H", "Accept: application/json",
             "-H", "Content-Type: application/json",
             "-H", "Authorization: MediaBrowser Client=mpv, Device=mpv, DeviceId=mpv, Version=1.0",
@@ -381,20 +407,37 @@ local function connect()
     })
 
     if not req or not req.stdout or #req.stdout == 0 then
-        msg.error("Jellyfin auth failed: empty response")
+        msg.error("Jellyfin auth failed on "..url..": empty response")
         msg.error(req and req.stderr or "")
-        return
+        return nil
     end
 
     local result = utils.parse_json(req.stdout)
     if not result or not result.User or not result.AccessToken then
-        msg.error("Jellyfin auth failed: invalid JSON")
+        msg.error("Jellyfin auth failed on "..url..": invalid JSON")
         msg.error(req.stdout)
-        return
+        return nil
     end
 
-    user_id = result.User.Id
-    api_key = result.AccessToken
+    return result
+end
+
+connect_to_first_answering_server = function(start_index)
+    start_index = start_index or url_index
+    for n = 0, #urls-1 do
+        local i = (start_index + n - 1) % #urls + 1
+        local result = authenticate_on_server(urls[i])
+        if result then
+            if i ~= url_index then msg.info("Using Jellyfin server "..urls[i]) end
+            url_index = i
+            options.url = urls[i]
+            user_id = result.User.Id
+            api_key = result.AccessToken
+            return true
+        end
+    end
+    msg.error("Jellyfin auth failed: no server answered")
+    return false
 end
 
 toggle_overlay = function()
@@ -411,7 +454,7 @@ toggle_overlay = function()
         mp.add_forced_key_binding("RIGHT", "jright", key_right)
         mp.add_forced_key_binding("DOWN", "jdown", key_down, { repeatable = true })
         mp.add_forced_key_binding("LEFT", "jleft", key_left)
-        if #api_key <= 0 then connect() end
+        if #api_key <= 0 then connect_to_first_answering_server() end
         if #items == 0 then
             update_overlay()
         else
