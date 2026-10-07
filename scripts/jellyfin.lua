@@ -290,10 +290,14 @@ local function update_overlay()
     local url = base_url.."&searchTerm="..user_query
     local json = send_request("GET", url)
     if json == nil or #json.Items == 0 then --no results
-        items = send_request("GET", base_url).Items
-    else
-        items = json.Items
+        json = send_request("GET", base_url)
     end
+    if json == nil then
+        overlay.data = "{\\fs16}Could not reach the Jellyfin server"
+        overlay:update()
+        return
+    end
+    items = json.Items
     local start_time = mp.get_time()
     update_data()
     msg.debug(string.format("Updating overlay data took %.3f seconds", mp.get_time() - start_time))
@@ -401,7 +405,7 @@ local function authenticate_on_server(url)
             "-H", "Accept: application/json",
             "-H", "Content-Type: application/json",
             "-H", "Authorization: MediaBrowser Client=mpv, Device=mpv, DeviceId=mpv, Version=1.0",
-            "-d", string.format('{"Username":"%s","Pw":"%s"}', options.username, options.password)
+            "-d", utils.format_json({Username = options.username, Pw = options.password})
         }
     })
 
@@ -468,22 +472,11 @@ local function disable_overlay()
     toggle_overlay()
 end
 
-local function split(inputstr, sep)
-    if sep == nil then
-        sep = "%s"
-    end
-    local t = {}
-    for str in string.gmatch(inputstr, "([^"..sep.."]+)") do
-        table.insert(t, str)
-    end
-    return t
-end
-
 local function get_playing_item()
     if #items == 0 then return nil end
     local path = mp.get_property("path")
     if path == nil then return nil end
-    local video_id = split(path, '/')[4]
+    local video_id = path:match("/Videos/([^/]+)/stream")
     for i = 1, #items do
         if items[i].Id == video_id then
             return items[i]
@@ -540,14 +533,16 @@ local function unpause()
     mp.set_property("force-media-title", "")
 end
 
-local function url_fix(str) -- add more later?
-    return string.gsub(str, " ", "%%20")
+local function url_encode(str)
+    return (str:gsub("[^%w%-%._~]", function(c)
+        return string.format("%%%02X", string.byte(c))
+    end))
 end
 
 local function search(query, err)
     if query ~= nil then
-        local result = url_fix(query)
-        user_query = result.."&recursive=true"
+        user_query = url_encode(query).."&recursive=true"
+        selection[layer] = 1
         shown = false
         items = {}
         toggle_overlay()
