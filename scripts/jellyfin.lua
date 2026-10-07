@@ -317,7 +317,6 @@ local function play_video()
     end
     local id = items[selection[layer]].Id
     mp.commandv("loadfile", options.url.."/Videos/"..id.."/stream?static=true", "insert-at-play", selection[layer]-1)
-    mp.set_property("force-media-title", items[selection[layer]].Name)
 end
 
 move_up = function()
@@ -523,6 +522,19 @@ local function add_subs()
     end
 end
 
+local function format_media_title(item)
+    if item.Type == "Episode" and item.SeriesName and item.ParentIndexNumber and item.IndexNumber then
+        return string.format("%s S%02dE%02d %s", item.SeriesName, item.ParentIndexNumber, item.IndexNumber, item.Name)
+    end
+    return item.Name
+end
+
+local function set_media_title()
+    local item = get_playing_item()
+    if item == nil then return end
+    mp.set_property("force-media-title", format_media_title(item))
+end
+
 local function unpause()
     mp.set_property_bool("pause", false)
     mp.set_property("force-media-title", "")
@@ -596,6 +608,7 @@ else
     if input_success then
         mp.add_key_binding("Ctrl+f", "jf_search", search_input)
     end
+    mp.register_event("start-file", set_media_title)
     mp.register_event("file-loaded", add_subs)
     if options.show_by_default == "on" then toggle_overlay() end
     if options.show_on_idle == "on" then
