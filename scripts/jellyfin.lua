@@ -20,6 +20,7 @@ local options = {
     colour_selected = "FF",
     colour_watched = "A0A0A0",
     sort_mode = 0,
+    resume = "on",
     connect_timeout = 5
 }
 opt.read_options(options, mp.get_script_name())
@@ -51,7 +52,7 @@ local layer = 1
 
 local items = {}
 local ow, oh, op = 0, 0, 0
-local async = {} -- 1 = image thread, 2 = request thread
+local async = {} -- 1 = image thread
 
 local align_x = 1 -- 1 = left, 2 = center, 3 = right
 local align_y = 4 -- 4 = top, 8 = center, 0 = bottom
@@ -107,20 +108,26 @@ local function send_request(method, url, is_retry)
     return nil
 end
 
-local function clear_request(success, result, error)
-    async[2] = nil
-end
-
-local function send_request_async(method, url)
-    if #api_key > 0 and async[2] == nil then -- multiple requests are just discarded
-        async[2] = mp.command_native_async({
-            name = "subprocess",
-            playback_only = false,
-            args = {"curl", "-X", method, url, "-H", "Authorization: MediaBrowser Token=\""..api_key.."\""}
-        }, function(success, result, error) clear_request(success, result, error) end)
-        return 0
+local function post_json(endpoint, body, wait_for_response)
+    if #api_key == 0 then return end
+    local command = {
+        name = "subprocess",
+        capture_stdout = true,
+        playback_only = false,
+        args = {
+            "curl", "-sS",
+            "--connect-timeout", tostring(options.connect_timeout),
+            "-X", "POST", options.url..endpoint,
+            "-H", "Content-Type: application/json",
+            "-H", "Authorization: MediaBrowser Token=\""..api_key.."\"",
+            "-d", utils.format_json(body)
+        }
+    }
+    if wait_for_response then
+        mp.command_native(command)
+    else
+        mp.command_native_async(command, function() end)
     end
-    return 1
 end
 
 local function line_break(str, flags, space)
@@ -485,18 +492,67 @@ local function get_playing_item()
     return nil
 end
 
-local function check_percent()
-    local pos = mp.get_property_number("percent-pos")
-    if pos == nil then return end
-    if pos <= 94 then return end
-    local item = get_playing_item()
-    if item == nil then return end
-    local UserData = item.UserData -- pointer
-    if UserData == nil then return end
-    if UserData.Played == false then
-        local err = send_request_async("POST", options.url.."/Users/"..user_id.."/PlayedItems/"..item.Id)
-        if err == 0 then UserData.Played = true end
+local TICKS_PER_SECOND = 10000000
+local JELLYFIN_DEFAULT_MIN_RESUME_RATIO = 0.05
+local JELLYFIN_DEFAULT_MAX_RESUME_RATIO = 0.9
+
+local playing_item = nil
+local playing_position = 0
+
+local function playback_state()
+    return {
+        ItemId = playing_item.Id,
+        MediaSourceId = playing_item.Id,
+        PositionTicks = math.floor(playing_position * TICKS_PER_SECOND),
+        IsPaused = mp.get_property_bool("pause", false),
+        CanSeek = true,
+        PlayMethod = "DirectPlay"
+    }
+end
+
+local function resume_and_report_playback_start()
+    playing_item = get_playing_item()
+    playing_position = 0
+    if playing_item == nil then return end
+    local resume_ticks = playing_item.UserData and playing_item.UserData.PlaybackPositionTicks or 0
+    if options.resume ~= "off" and resume_ticks > 0 then
+        playing_position = resume_ticks / TICKS_PER_SECOND
+        mp.set_property("file-local-options/start", tostring(playing_position))
     end
+    post_json("/Sessions/Playing", playback_state())
+end
+
+local function report_playback_progress()
+    if playing_item == nil then return end
+    post_json("/Sessions/Playing/Progress", playback_state())
+end
+
+local function track_playing_position(_, position)
+    if position ~= nil then playing_position = position end
+end
+
+local function update_local_user_data(item, position_ticks)
+    if item.UserData == nil or item.RunTimeTicks == nil then return end
+    local watched_ratio = position_ticks / item.RunTimeTicks
+    if watched_ratio >= JELLYFIN_DEFAULT_MAX_RESUME_RATIO then
+        item.UserData.Played = true
+        item.UserData.PlaybackPositionTicks = 0
+    elseif watched_ratio < JELLYFIN_DEFAULT_MIN_RESUME_RATIO then
+        item.UserData.PlaybackPositionTicks = 0
+    else
+        item.UserData.PlaybackPositionTicks = position_ticks
+    end
+end
+
+local function report_playback_stop(event)
+    if playing_item == nil then return end
+    if event.reason == "eof" and playing_item.RunTimeTicks then
+        playing_position = playing_item.RunTimeTicks / TICKS_PER_SECOND
+    end
+    local state = playback_state()
+    post_json("/Sessions/Playing/Stopped", state, true)
+    update_local_user_data(playing_item, state.PositionTicks)
+    playing_item = nil
 end
 
 local function add_subs()
@@ -590,7 +646,11 @@ local version_num = tonumber(string.sub(mp.get_property("mpv-version"), 8, 11))
 if version_num < 38.0 then
     print("Minimum mpv version not met for mpv-jellyfin script.")
 else
-    mp.add_periodic_timer(1, check_percent)
+    mp.add_hook("on_load", 50, resume_and_report_playback_start)
+    mp.add_periodic_timer(10, report_playback_progress)
+    mp.observe_property("pause", "bool", report_playback_progress)
+    mp.observe_property("time-pos", "number", track_playing_position)
+    mp.register_event("end-file", report_playback_stop)
     mp.add_key_binding("Ctrl+j", "jf", toggle_overlay)
     mp.add_key_binding("ESC", nil, disable_overlay)
     if options.hide_images ~= "on" then

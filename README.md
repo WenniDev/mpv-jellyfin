@@ -7,7 +7,7 @@
 - Navigate your libraries and play files
 - Some basic metadata is shown for each item
 - If an item is unwatched, it's description is hidden to prevent spoilers
-- When a video file finishes playing, it will be marked as watched
+- Playback progress is synced with the server: videos resume where you stopped, from mpv or any other Jellyfin client, and are marked as watched once finished
 
 ## Installation
 
